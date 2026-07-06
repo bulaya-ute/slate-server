@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using NpgsqlTypes;
@@ -12,9 +13,11 @@ using Slate.Server.Data;
 namespace Slate.Server.Data.Migrations
 {
     [DbContext(typeof(SlateDbContext))]
-    partial class SlateDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260706071911_AddRefreshTokenFamilyId")]
+    partial class AddRefreshTokenFamilyId
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

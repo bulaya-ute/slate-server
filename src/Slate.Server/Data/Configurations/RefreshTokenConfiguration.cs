@@ -13,5 +13,7 @@ public class RefreshTokenConfiguration : IEntityTypeConfiguration<RefreshToken>
 
         builder.Property(rt => rt.TokenHash).IsRequired();
         builder.HasIndex(rt => rt.TokenHash).IsUnique();
+
+        builder.HasIndex(rt => rt.FamilyId);
     }
 }

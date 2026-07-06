@@ -14,12 +14,20 @@ public class SlateOptions
     public required string JwtSecret { get; init; }
     public required string ServerName { get; init; }
 
+    /// <summary>
+    /// Fixed-window permit limit applied per client IP to /api/auth/* (design spec: ~10/min).
+    /// Overridable so integration tests can raise it well above what the functional test suite
+    /// itself calls in a one-minute window, while a dedicated rate-limit test lowers it instead.
+    /// </summary>
+    public required int AuthRateLimitPerMinute { get; init; }
+
     public static SlateOptions FromConfiguration(IConfiguration configuration)
     {
         var dataDir = Resolve(configuration, "SLATE_DATA_DIR", "Slate:DataDir", "./.slate-data");
         var dbConnection = Resolve(configuration, "SLATE_DB_CONNECTION", "Slate:DbConnection");
         var serverName = Resolve(configuration, "SLATE_SERVER_NAME", "Slate:ServerName", "Slate");
         var jwtSecret = ResolveJwtSecret(configuration, dataDir);
+        var authRateLimitPerMinute = ResolveAuthRateLimitPerMinute(configuration);
 
         return new SlateOptions
         {
@@ -27,6 +35,7 @@ public class SlateOptions
             DataDir = dataDir,
             JwtSecret = jwtSecret,
             ServerName = serverName,
+            AuthRateLimitPerMinute = authRateLimitPerMinute,
         };
     }
 
@@ -86,5 +95,11 @@ public class SlateOptions
         var generated = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));
         File.WriteAllText(secretPath, generated);
         return generated;
+    }
+
+    private static int ResolveAuthRateLimitPerMinute(IConfiguration configuration)
+    {
+        var raw = configuration["SLATE_AUTH_RATE_LIMIT_PER_MINUTE"] ?? configuration["Slate:AuthRateLimitPerMinute"];
+        return int.TryParse(raw, out var parsed) && parsed > 0 ? parsed : 10;
     }
 }
