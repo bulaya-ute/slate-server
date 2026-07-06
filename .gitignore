@@ -427,3 +427,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Slate local dev data dir (SLATE_DATA_DIR default "./.slate-data"): vault files, auto-generated jwt-secret
+/src/Slate.Server/.slate-data/
