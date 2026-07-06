@@ -18,6 +18,14 @@ namespace Slate.Server.Auth;
 [EnableRateLimiting("auth")]
 public class AuthController : SlateControllerBase
 {
+    // Precomputed once, against a throwaway password, purely so the "user not found" branch of
+    // Login below can pay an Argon2id verify of comparable cost to the real-user branch. Without
+    // this, an unknown username short-circuits before ever touching the (deliberately slow)
+    // Argon2id verify, and the resulting timing gap lets an attacker enumerate valid usernames
+    // by measuring response latency alone.
+    private static readonly string DummyPasswordHash =
+        new Argon2PasswordHasher().Hash(Guid.NewGuid().ToString("N"));
+
     private readonly SlateDbContext _db;
     private readonly IPasswordHasher _passwordHasher;
     private readonly IJwtTokenService _jwtTokenService;
@@ -45,7 +53,16 @@ public class AuthController : SlateControllerBase
         }
 
         var user = await _db.Users.SingleOrDefaultAsync(u => u.Username == request.Username, cancellationToken);
-        if (user is null || !_passwordHasher.Verify(request.Password, user.PasswordHash))
+        if (user is null)
+        {
+            // No such user: still pay the Argon2id cost (against a fixed dummy hash) so this
+            // path takes about as long as a real-user wrong-password rejection below, rather
+            // than returning near-instantly and leaking username validity via timing.
+            _passwordHasher.Verify(request.Password, DummyPasswordHash);
+            return Error(StatusCodes.Status401Unauthorized, "invalid_credentials", "Invalid username or password.");
+        }
+
+        if (!_passwordHasher.Verify(request.Password, user.PasswordHash))
         {
             return Error(StatusCodes.Status401Unauthorized, "invalid_credentials", "Invalid username or password.");
         }
@@ -133,12 +150,15 @@ public class AuthController : SlateControllerBase
         }
 
         var tokenHash = TokenHasher.Hash(request.InviteToken);
-        var invite = await _db.Invites.SingleOrDefaultAsync(i => i.TokenHash == tokenHash, cancellationToken);
+        var invite = await _db.Invites.AsNoTracking().SingleOrDefaultAsync(i => i.TokenHash == tokenHash, cancellationToken);
         if (invite is null)
         {
             return Error(StatusCodes.Status401Unauthorized, "invalid_invite", "Invite token is invalid.");
         }
 
+        // Fast-path rejections: cheap, common-case checks that don't need to be part of the
+        // atomic claim below. The real, race-proof enforcement of "single use" happens via the
+        // conditional ExecuteUpdateAsync further down - these are just early-outs.
         if (invite.UsedAt is not null || invite.UsedBy is not null)
         {
             return Error(StatusCodes.Status410Gone, "invite_already_used", "This invite has already been used.");
@@ -166,12 +186,33 @@ public class AuthController : SlateControllerBase
             CreatedAt = now,
             UpdatedAt = now,
         };
+
+        // Two concurrent registers can both read the invite above as unused before either
+        // commits (classic read-check-then-write TOCTOU), which would redeem one single-use
+        // invite twice. Close it by making the actual redemption an atomic conditional UPDATE -
+        // only the request that flips UsedAt from null to non-null wins - and keep the user
+        // insert in the same transaction so a losing claim rolls the user creation back too
+        // (the FK from invites.used_by to users.id also requires the user row to exist, even if
+        // only within this uncommitted transaction, before the invite can reference it - hence
+        // insert-then-claim rather than claim-then-insert).
+        await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
+
         _db.Users.Add(user);
-
-        invite.UsedAt = now;
-        invite.UsedBy = user.Id;
-
         await _db.SaveChangesAsync(cancellationToken);
+
+        var claimed = await _db.Invites
+            .Where(i => i.Id == invite.Id && i.UsedAt == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(i => i.UsedAt, now)
+                .SetProperty(i => i.UsedBy, user.Id), cancellationToken);
+
+        if (claimed == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return Error(StatusCodes.Status410Gone, "invite_already_used", "This invite has already been used.");
+        }
+
+        await transaction.CommitAsync(cancellationToken);
 
         var accessToken = _jwtTokenService.CreateAccessToken(user);
         var refreshToken = await _refreshTokenService.IssueAsync(user.Id, cancellationToken: cancellationToken);

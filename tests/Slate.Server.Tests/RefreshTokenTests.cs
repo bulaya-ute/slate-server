@@ -52,6 +52,42 @@ public class RefreshTokenTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Unauthorized, afterReuseResponse.StatusCode);
     }
 
+    // Reproduces the rotation TOCTOU directly: without the atomic claim, both concurrent
+    // rotations of the same valid token can pass the RevokedAt-null check before either commits,
+    // each minting its own successor without ever tripping reuse detection.
+    [Fact]
+    public async Task Refresh_ConcurrentRotationOfSameToken_OnlyOneSucceeds_AndTheLoserRevokesTheFamily()
+    {
+        var client = _app.CreateClient();
+        var login = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "concurrent-refresh-admin");
+
+        var clientA = _app.CreateClient();
+        var clientB = _app.CreateClient();
+
+        var requestA = clientA.PostAsJsonAsync("/api/auth/refresh", new { refreshToken = login.RefreshToken });
+        var requestB = clientB.PostAsJsonAsync("/api/auth/refresh", new { refreshToken = login.RefreshToken });
+
+        var responses = await Task.WhenAll(requestA, requestB);
+
+        var successResponses = responses.Where(r => r.StatusCode == HttpStatusCode.OK).ToList();
+        var reusedResponses = responses.Where(r => r.StatusCode == HttpStatusCode.Unauthorized).ToList();
+
+        Assert.Single(successResponses);
+        Assert.Single(reusedResponses);
+
+        var reusedBody = await reusedResponses[0].Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("refresh_token_reused", reusedBody.GetProperty("error").GetProperty("code").GetString());
+
+        var successBody = await successResponses[0].Content.ReadFromJsonAsync<JsonElement>();
+        var winnersNewRefreshToken = successBody.GetProperty("refreshToken").GetString();
+
+        // Reuse detection must revoke the whole family: the winner's own brand-new successor
+        // token - never itself replayed - is unusable too, because the loser's concurrent replay
+        // attempt against the same family looks exactly like token theft.
+        var followUp = await client.PostAsJsonAsync("/api/auth/refresh", new { refreshToken = winnersNewRefreshToken });
+        Assert.Equal(HttpStatusCode.Unauthorized, followUp.StatusCode);
+    }
+
     [Fact]
     public async Task Refresh_WithUnknownToken_ReturnsUnauthorized()
     {

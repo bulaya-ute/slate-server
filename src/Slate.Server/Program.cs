@@ -1,5 +1,6 @@
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Slate.Server.Auth;
@@ -50,6 +51,31 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("AdminOnly", policy => policy.RequireRole("admin"));
 });
 
+// The rate limiter below (and anything else that reads Connection.RemoteIpAddress) needs the
+// real client IP, not the reverse proxy's, whenever the app sits behind one (the documented
+// Caddy/Traefik deployment). ForwardedHeadersMiddleware rewrites RemoteIpAddress/Request.Scheme
+// from X-Forwarded-For/X-Forwarded-Proto - but only when the *immediate* connection is from a
+// KnownProxies/KnownNetworks entry, so an internet client can't just forge the header to spoof
+// an arbitrary source IP. KnownProxies/KnownNetworks are resolved via SlateOptions (SLATE_KNOWN_PROXIES)
+// for the same test-override reasons as the other options above.
+builder.Services.AddOptions<ForwardedHeadersOptions>()
+    .Configure<SlateOptions>((options, slateOptions) =>
+    {
+        options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+        options.KnownProxies.Clear();
+        options.KnownNetworks.Clear();
+
+        foreach (var proxy in slateOptions.KnownProxies)
+        {
+            options.KnownProxies.Add(proxy);
+        }
+
+        foreach (var network in slateOptions.KnownProxyNetworks)
+        {
+            options.KnownNetworks.Add(network);
+        }
+    });
+
 // Fixed-window rate limit on /api/auth/* (design spec: ~10/min/IP), partitioned by client IP.
 // The permit limit is configurable (SLATE_AUTH_RATE_LIMIT_PER_MINUTE) so the integration test
 // suite can raise it well above anything the functional tests themselves call in one minute,
@@ -73,6 +99,12 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
+
+// Must run before anything that reads Request.Scheme or Connection.RemoteIpAddress - including
+// UseHttpsRedirection below and the rate limiter's partition-key selector - so both see the real
+// client, not the reverse proxy, when SLATE_KNOWN_PROXIES (or its private-network default; see
+// SlateOptions) trusts the immediate connection.
+app.UseForwardedHeaders();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())

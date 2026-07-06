@@ -60,4 +60,19 @@ public class LoginTests : IAsyncLifetime
         var body = await response.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("invalid_credentials", body.GetProperty("error").GetProperty("code").GetString());
     }
+
+    // Guards against reintroducing the username-enumeration timing side channel: an unknown
+    // username must fail exactly like a known username with a wrong password - same status code,
+    // same error code - rather than short-circuiting before the Argon2id verify.
+    [Fact]
+    public async Task Login_UnknownUsername_ReturnsUnauthorizedWithSameErrorEnvelopeAsWrongPassword()
+    {
+        var client = _app.CreateClient();
+
+        var response = await AuthTestHelpers.LoginRawAsync(client, "no-such-user", "whatever-password");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("invalid_credentials", body.GetProperty("error").GetProperty("code").GetString());
+    }
 }
