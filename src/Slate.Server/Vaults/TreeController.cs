@@ -74,7 +74,7 @@ public class TreeController : SlateControllerBase
         // Windows/macOS filesystems collapse case (so "Notes" and "notes" are the same directory
         // entry there) but Postgres and Linux prod don't - catch the mismatch at the app level
         // rather than let it manifest as a confusing disk-level failure or silent divergence.
-        if (HasCaseOnlyCollision(v, path))
+        if (VaultPathCollision.HasCaseOnlyCollision(_storage, v, path))
         {
             return Error(StatusCodes.Status409Conflict, "case_conflict",
                 "A file or folder with the same name (different case) already exists.");
@@ -138,7 +138,7 @@ public class TreeController : SlateControllerBase
             return Error(StatusCodes.Status404NotFound, "folder_not_found", "No such folder.");
         }
 
-        if (HasCaseOnlyCollision(v, newPath, excludePrefix: oldPath))
+        if (VaultPathCollision.HasCaseOnlyCollision(_storage, v, newPath, excludePrefix: oldPath))
         {
             return Error(StatusCodes.Status409Conflict, "case_conflict",
                 "A file or folder with the same name (different case) already exists at the destination.");
@@ -367,33 +367,6 @@ public class TreeController : SlateControllerBase
         return await _db.Notes
             .Where(n => n.VaultId == vaultId && !n.IsDeleted && (n.Path == folderPath || n.Path.StartsWith(prefix)))
             .ToListAsync(cancellationToken);
-    }
-
-    /// <summary>
-    /// True if some existing file or folder already occupies <paramref name="targetPath"/>
-    /// case-insensitively under a different exact casing. Windows/macOS filesystems collapse case
-    /// (so the two would collide there) even though Postgres and Linux prod treat them as distinct.
-    /// Entries at or under <paramref name="excludePrefix"/> are ignored, so renaming a folder to a
-    /// different case of its own current name (or moving its own contents) doesn't flag itself.
-    /// Only checks the exact target path, not intermediate ancestor segments, to keep this cheap.
-    /// </summary>
-    private bool HasCaseOnlyCollision(Guid vaultId, string targetPath, string? excludePrefix = null)
-    {
-        foreach (var entry in _storage.ListAll(vaultId))
-        {
-            if (excludePrefix is not null
-                && (entry.Path == excludePrefix || entry.Path.StartsWith(excludePrefix + "/", StringComparison.Ordinal)))
-            {
-                continue;
-            }
-
-            if (entry.Path != targetPath && entry.Path.Equals(targetPath, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private string ResolveDeviceId() =>
