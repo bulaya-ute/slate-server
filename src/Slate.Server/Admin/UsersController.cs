@@ -127,6 +127,17 @@ public class UsersController : SlateControllerBase
             return Error(StatusCodes.Status404NotFound, "user_not_found", "No such user.");
         }
 
+        // vaults.owner_id is a Restrict FK (a vault must always have a real owner), so deleting an
+        // owner out from under their vault(s) would otherwise bubble up as a raw DbUpdateException.
+        // Check explicitly and fail with a meaningful, actionable error instead: the admin must
+        // transfer ownership or delete the vault(s) first.
+        var ownsVaults = await _db.Vaults.AnyAsync(v => v.OwnerId == id, cancellationToken);
+        if (ownsVaults)
+        {
+            return Error(StatusCodes.Status409Conflict, "user_owns_vaults",
+                "This user still owns one or more vaults. Transfer ownership or delete those vaults first.");
+        }
+
         _db.Users.Remove(user);
         await _db.SaveChangesAsync(cancellationToken);
 

@@ -18,10 +18,15 @@ public class InviteConfiguration : IEntityTypeConfiguration<Invite>
             .HasConversion(EnumConversions.ForEnum<UserRole>())
             .IsRequired();
 
+        // Cascade (not Restrict): an invite is disposable admin tooling, not a durable record
+        // that must outlive its creator. Deleting a user should not be blocked by invites they
+        // issued - unused ones are simply gone, and any already-redeemed invite's used_by/used_at
+        // audit trail lives independently (see used_by's SetNull below, keyed off the redeemer,
+        // not the creator).
         builder.HasOne(i => i.CreatedByUser)
             .WithMany()
             .HasForeignKey(i => i.CreatedBy)
-            .OnDelete(DeleteBehavior.Restrict);
+            .OnDelete(DeleteBehavior.Cascade);
 
         builder.HasOne(i => i.UsedByUser)
             .WithMany()

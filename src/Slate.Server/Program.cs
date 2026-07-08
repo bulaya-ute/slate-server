@@ -7,6 +7,7 @@ using Slate.Server.Auth;
 using Slate.Server.Common;
 using Slate.Server.Configuration;
 using Slate.Server.Data;
+using Slate.Server.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -32,6 +33,10 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddSingleton<IPasswordHasher, Argon2PasswordHasher>();
 builder.Services.AddSingleton<IJwtTokenService, JwtTokenService>();
 builder.Services.AddScoped<IRefreshTokenService, RefreshTokenService>();
+
+// Singleton: the write-marker registry (RegisterWrite/WasOurWrite, for S5's watcher echo
+// suppression) is in-memory, process-wide state that must survive across requests/scopes.
+builder.Services.AddSingleton<IVaultStorage, VaultStorage>();
 
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
