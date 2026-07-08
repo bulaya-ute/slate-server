@@ -39,6 +39,29 @@ public interface IVaultStorage
     /// </summary>
     Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(Guid vaultId, string path, string content, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Writes an attachment's raw bytes atomically (same temp-file-then-rename discipline as
+    /// <see cref="WriteNoteAtomicAsync"/>, just without the UTF-8 text encoding step - attachments
+    /// are arbitrary binary content). Returns the SHA-256 hash (lowercase hex) and byte length.
+    /// </summary>
+    Task<(string Sha256, long SizeBytes)> WriteAttachmentAtomicAsync(Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads an attachment's raw bytes. Throws <see cref="FileNotFoundException"/> if it doesn't exist.</summary>
+    Task<byte[]> ReadAttachmentAsync(Guid vaultId, string path, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Writes a sync-conflict blob under the vault's reserved <c>.slate/conflicts/</c> subtree,
+    /// keyed by the revision id that recorded the conflict (see the Sync protocol conflict path in
+    /// the design spec). Deliberately bypasses <see cref="SafePath"/>'s "'.slate' is reserved"
+    /// rejection - this is the one legitimate internal writer of that subtree, never reachable from
+    /// caller-supplied note/attachment/folder paths. Returns the SHA-256 hash (lowercase hex) and
+    /// byte length of the UTF-8-encoded content.
+    /// </summary>
+    Task<(string Sha256, long SizeBytes)> WriteConflictBlobAsync(Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads a previously written conflict blob. Throws <see cref="FileNotFoundException"/> if it doesn't exist.</summary>
+    Task<string> ReadConflictBlobAsync(Guid vaultId, long revisionId, CancellationToken cancellationToken = default);
+
     /// <summary>Deletes a single file. Idempotent: no error if it's already gone.</summary>
     Task DeleteAsync(Guid vaultId, string path, CancellationToken cancellationToken = default);
 

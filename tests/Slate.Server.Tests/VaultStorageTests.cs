@@ -253,4 +253,56 @@ public class VaultStorageTests : IAsyncLifetime
 
         Assert.Throws<VaultConflictException>(() => _storage.CreateFolder(vaultId, "notes"));
     }
+
+    [Fact]
+    public async Task WriteAttachmentAtomic_ProducesFileWithCorrectHashAndSize()
+    {
+        var vaultId = Guid.NewGuid();
+        var bytes = new byte[] { 1, 2, 3, 4, 250, 251, 252 };
+
+        var (hash, size) = await _storage.WriteAttachmentAtomicAsync(vaultId, "images/a.png", bytes);
+
+        var expectedHash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        Assert.Equal(expectedHash, hash);
+        Assert.Equal(bytes.Length, size);
+
+        var readBack = await _storage.ReadAttachmentAsync(vaultId, "images/a.png");
+        Assert.Equal(bytes, readBack);
+    }
+
+    [Fact]
+    public async Task ReadAttachment_MissingFile_ThrowsFileNotFoundException()
+    {
+        var vaultId = Guid.NewGuid();
+        await Assert.ThrowsAsync<FileNotFoundException>(() => _storage.ReadAttachmentAsync(vaultId, "nope.png"));
+    }
+
+    [Fact]
+    public async Task WriteConflictBlob_WritesUnderReservedSlateSubtree_AndIsReadable()
+    {
+        var vaultId = Guid.NewGuid();
+        const string content = "conflicting content";
+
+        var (hash, size) = await _storage.WriteConflictBlobAsync(vaultId, 42, content);
+
+        var expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+        Assert.Equal(expectedHash, hash);
+        Assert.Equal(Encoding.UTF8.GetByteCount(content), size);
+
+        var fullPath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), ".slate", "conflicts", "42.md");
+        Assert.True(File.Exists(fullPath));
+
+        var readBack = await _storage.ReadConflictBlobAsync(vaultId, 42);
+        Assert.Equal(content, readBack);
+
+        // Conflict blobs must never surface through the normal vault-content listing.
+        Assert.DoesNotContain(_storage.ListAll(vaultId), e => e.Path.StartsWith(".slate", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task ReadConflictBlob_MissingRevision_ThrowsFileNotFoundException()
+    {
+        var vaultId = Guid.NewGuid();
+        await Assert.ThrowsAsync<FileNotFoundException>(() => _storage.ReadConflictBlobAsync(vaultId, 999));
+    }
 }

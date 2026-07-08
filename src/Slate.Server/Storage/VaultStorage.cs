@@ -108,47 +108,50 @@ public class VaultStorage : IVaultStorage
         return await File.ReadAllTextAsync(fullPath, Encoding.UTF8, cancellationToken);
     }
 
-    public async Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(
+    public Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(
         Guid vaultId, string path, string content, CancellationToken cancellationToken = default)
     {
         var fullPath = ResolvePath(vaultId, path);
-        var directory = Path.GetDirectoryName(fullPath)!;
-        Directory.CreateDirectory(directory);
+        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken);
+    }
 
-        var bytes = Encoding.UTF8.GetBytes(content);
-        // Lowercase to match the documented contract (IVaultStorage.WriteNoteAtomicAsync) and
-        // common tooling conventions - Convert.ToHexString itself yields uppercase.
-        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    public Task<(string Sha256, long SizeBytes)> WriteAttachmentAtomicAsync(
+        Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default)
+    {
+        var fullPath = ResolvePath(vaultId, path);
+        return WriteBytesAtomicAsync(fullPath, content, cancellationToken);
+    }
 
-        var tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.tmp-{Guid.NewGuid():N}");
-
-        try
+    public async Task<byte[]> ReadAttachmentAsync(Guid vaultId, string path, CancellationToken cancellationToken = default)
+    {
+        var fullPath = ResolvePath(vaultId, path);
+        if (!File.Exists(fullPath))
         {
-            await File.WriteAllBytesAsync(tempPath, bytes, cancellationToken);
-
-            // Registered before the rename lands: a watcher event firing the instant the rename
-            // completes must already find a fresh marker (see RegisterWrite/WasOurWrite docs).
-            RegisterWrite(fullPath, hash);
-
-            // Temp file lives in the same directory as the destination, so this rename is a
-            // same-volume atomic replace - readers never observe a partially-written file.
-            File.Move(tempPath, fullPath, overwrite: true);
-        }
-        catch
-        {
-            try
-            {
-                File.Delete(tempPath);
-            }
-            catch
-            {
-                // Best-effort cleanup only; the original exception is what matters and propagates below.
-            }
-
-            throw;
+            throw new FileNotFoundException($"No such file: {path}", fullPath);
         }
 
-        return (hash, bytes.LongLength);
+        return await File.ReadAllBytesAsync(fullPath, cancellationToken);
+    }
+
+    public Task<(string Sha256, long SizeBytes)> WriteConflictBlobAsync(
+        Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default)
+    {
+        // Bypasses ResolvePath/SafePath entirely - revisionId is a server-generated bigserial, never
+        // caller-supplied text, so there's no traversal surface to validate against here, and
+        // SafePath would reject the ".slate" segment outright regardless (see IVaultStorage docs).
+        var fullPath = ConflictBlobPath(vaultId, revisionId);
+        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken);
+    }
+
+    public async Task<string> ReadConflictBlobAsync(Guid vaultId, long revisionId, CancellationToken cancellationToken = default)
+    {
+        var fullPath = ConflictBlobPath(vaultId, revisionId);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException($"No such conflict blob: {revisionId}", fullPath);
+        }
+
+        return await File.ReadAllTextAsync(fullPath, Encoding.UTF8, cancellationToken);
     }
 
     public Task DeleteAsync(Guid vaultId, string path, CancellationToken cancellationToken = default)
@@ -277,7 +280,57 @@ public class VaultStorage : IVaultStorage
         return false;
     }
 
+    /// <summary>
+    /// Shared atomic-write core for <see cref="WriteNoteAtomicAsync"/>, <see cref="WriteAttachmentAtomicAsync"/>,
+    /// and <see cref="WriteConflictBlobAsync"/>: write to a temp file in the destination directory,
+    /// register the write-marker, then rename over the destination so readers never observe a
+    /// partially-written file.
+    /// </summary>
+    private async Task<(string Sha256, long SizeBytes)> WriteBytesAtomicAsync(
+        string fullPath, byte[] bytes, CancellationToken cancellationToken)
+    {
+        var directory = Path.GetDirectoryName(fullPath)!;
+        Directory.CreateDirectory(directory);
+
+        // Lowercase to match the documented contract (IVaultStorage.WriteNoteAtomicAsync) and
+        // common tooling conventions - Convert.ToHexString itself yields uppercase.
+        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+        var tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.tmp-{Guid.NewGuid():N}");
+
+        try
+        {
+            await File.WriteAllBytesAsync(tempPath, bytes, cancellationToken);
+
+            // Registered before the rename lands: a watcher event firing the instant the rename
+            // completes must already find a fresh marker (see RegisterWrite/WasOurWrite docs).
+            RegisterWrite(fullPath, hash);
+
+            // Temp file lives in the same directory as the destination, so this rename is a
+            // same-volume atomic replace - readers never observe a partially-written file.
+            File.Move(tempPath, fullPath, overwrite: true);
+        }
+        catch
+        {
+            try
+            {
+                File.Delete(tempPath);
+            }
+            catch
+            {
+                // Best-effort cleanup only; the original exception is what matters and propagates below.
+            }
+
+            throw;
+        }
+
+        return (hash, bytes.LongLength);
+    }
+
     private string VaultRoot(Guid vaultId) => Path.Combine(_vaultsRoot, vaultId.ToString());
+
+    private string ConflictBlobPath(Guid vaultId, long revisionId) =>
+        Path.Combine(VaultRoot(vaultId), ".slate", "conflicts", $"{revisionId}.md");
 
     private string ResolvePath(Guid vaultId, string relativePath)
     {
