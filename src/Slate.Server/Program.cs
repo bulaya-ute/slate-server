@@ -7,6 +7,8 @@ using Slate.Server.Auth;
 using Slate.Server.Common;
 using Slate.Server.Configuration;
 using Slate.Server.Data;
+using Slate.Server.Notes;
+using Slate.Server.Search;
 using Slate.Server.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -38,6 +40,12 @@ builder.Services.AddScoped<IRefreshTokenService, RefreshTokenService>();
 // suppression) is in-memory, process-wide state that must survive across requests/scopes.
 builder.Services.AddSingleton<IVaultStorage, VaultStorage>();
 
+// No-op until S5 wires up the real SignalR-hub-backed broadcaster (see IRevisionBroadcaster docs) -
+// NoteService and friends call it unconditionally so that swap is a one-line DI change later.
+builder.Services.AddSingleton<IRevisionBroadcaster, NullRevisionBroadcaster>();
+builder.Services.AddScoped<NoteService>();
+builder.Services.AddScoped<SearchService>();
+
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer();
@@ -49,6 +57,30 @@ builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationSc
     {
         options.MapInboundClaims = false;
         options.TokenValidationParameters = JwtTokenService.ConfigureValidationParameters(slateOptions);
+
+        // GET /api/vaults/{v}/files/{**path} is used directly in <img> src etc., where the caller
+        // can't set an Authorization header - so (and only so) it also accepts the JWT via
+        // ?access_token=. Scoped to that one route by path shape (".../files/...") rather than
+        // applied to every request, so no other endpoint's auth model changes.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                if (string.IsNullOrEmpty(context.Token)
+                    && context.Request.Path.StartsWithSegments("/api/vaults", out var remainder)
+                    && remainder.Value is { } path
+                    && path.Contains("/files/", StringComparison.OrdinalIgnoreCase))
+                {
+                    var accessToken = context.Request.Query["access_token"];
+                    if (!string.IsNullOrEmpty(accessToken))
+                    {
+                        context.Token = accessToken;
+                    }
+                }
+
+                return Task.CompletedTask;
+            },
+        };
     });
 
 builder.Services.AddAuthorization(options =>
