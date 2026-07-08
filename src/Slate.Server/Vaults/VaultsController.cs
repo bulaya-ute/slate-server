@@ -20,11 +20,13 @@ public class VaultsController : SlateControllerBase
 {
     private readonly SlateDbContext _db;
     private readonly IVaultStorage _storage;
+    private readonly ILogger<VaultsController> _logger;
 
-    public VaultsController(SlateDbContext db, IVaultStorage storage)
+    public VaultsController(SlateDbContext db, IVaultStorage storage, ILogger<VaultsController> logger)
     {
         _db = db;
         _storage = storage;
+        _logger = logger;
     }
 
     [HttpGet]
@@ -113,7 +115,22 @@ public class VaultsController : SlateControllerBase
         // handle every DB row; only the on-disk content directory needs explicit cleanup.
         _db.Vaults.Remove(vault);
         await _db.SaveChangesAsync(cancellationToken);
-        _storage.DeleteVaultRoot(v);
+
+        try
+        {
+            _storage.DeleteVaultRoot(v);
+        }
+        catch (Exception ex)
+        {
+            // DB rows are already gone (cascade-deleted) and that's the source of truth for the
+            // app, so this isn't fatal to the request - but nothing else will ever retry this
+            // cleanup, so a loud log is the only way an admin finds out the directory needs
+            // manual removal.
+            _logger.LogError(ex,
+                "Failed to delete on-disk content directory for vault {VaultId} after its DB row was removed; " +
+                "directory is orphaned and needs manual cleanup.",
+                v);
+        }
 
         return NoContent();
     }

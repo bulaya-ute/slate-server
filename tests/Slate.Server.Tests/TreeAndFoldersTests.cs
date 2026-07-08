@@ -227,6 +227,95 @@ public class TreeAndFoldersTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RenameFolder_DiskMoveFails_RollsBackDbChangesAndReturnsConflict()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "tree-admin-12");
+        client.UseBearerToken(admin.AccessToken);
+
+        var vaultId = await CreateVaultAsync(client, "Rollback Vault");
+        var adminId = Guid.Parse(admin.User.GetProperty("id").GetString()!);
+
+        var note = await SeedNoteAsync(vaultId, "docs/a.md", "content A", adminId);
+
+        // Force the disk-level MoveFolder call to fail with a genuine "already exists" collision
+        // by pre-creating a *file* at the rename destination. With the DB-transaction-first
+        // ordering, SaveChangesAsync has already flushed the note's new path/rename revision to
+        // the (uncommitted) transaction by the time this failure is hit - the invariant under test
+        // is that the failed disk move causes a rollback, so neither side ends up changed.
+        var conflictingPath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), "documents");
+        Directory.CreateDirectory(Path.GetDirectoryName(conflictingPath)!);
+        await File.WriteAllTextAsync(conflictingPath, "in the way");
+
+        var renameResponse = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders/rename",
+            new { path = "docs", newPath = "documents" });
+
+        Assert.Equal(HttpStatusCode.Conflict, renameResponse.StatusCode);
+        var body = await renameResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("folder_conflict", body.GetProperty("error").GetProperty("code").GetString());
+
+        // DB rolled back: path unchanged, no rename revision was persisted.
+        using var scope = _app.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<SlateDbContext>();
+        var reloaded = await db.Notes.SingleAsync(n => n.Id == note.Id);
+        Assert.Equal("docs/a.md", reloaded.Path);
+        Assert.False(await db.Revisions.AnyAsync(r => r.NoteId == note.Id && r.Kind == RevisionKind.Rename));
+
+        // Disk unchanged too - the note's file is still under the original folder.
+        Assert.True(File.Exists(Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), "docs", "a.md")));
+
+        // Tree is still consistent: the original folder is reported, DB and disk agree.
+        var tree = await (await client.GetAsync($"/api/vaults/{vaultId}/tree")).Content.ReadFromJsonAsync<JsonElement>();
+        var folders = tree.GetProperty("folders").EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Contains("docs", folders);
+        var treeNotes = tree.GetProperty("notes").EnumerateArray().ToList();
+        Assert.Single(treeNotes);
+        Assert.Equal("docs/a.md", treeNotes[0].GetProperty("path").GetString());
+    }
+
+    [Fact]
+    public async Task RenameFolder_CaseOnlyCollisionAtDestination_ReturnsConflict()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "tree-admin-13");
+        client.UseBearerToken(admin.AccessToken);
+
+        var vaultId = await CreateVaultAsync(client, "Case Vault");
+
+        var createDocs = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders", new { path = "docs" });
+        Assert.Equal(HttpStatusCode.NoContent, createDocs.StatusCode);
+        var createNotes = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders", new { path = "Notes" });
+        Assert.Equal(HttpStatusCode.NoContent, createNotes.StatusCode);
+
+        // Renaming "docs" to "notes" collides case-insensitively with the existing "Notes" folder -
+        // fine on Linux/Postgres, but Windows/macOS filesystems would collapse the two.
+        var renameResponse = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders/rename",
+            new { path = "docs", newPath = "notes" });
+
+        Assert.Equal(HttpStatusCode.Conflict, renameResponse.StatusCode);
+        var body = await renameResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("case_conflict", body.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task CreateFolder_CaseOnlyCollisionWithExistingFolder_ReturnsConflict()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "tree-admin-14");
+        client.UseBearerToken(admin.AccessToken);
+
+        var vaultId = await CreateVaultAsync(client, "Case Vault 2");
+
+        var first = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders", new { path = "Archive" });
+        Assert.Equal(HttpStatusCode.NoContent, first.StatusCode);
+
+        var second = await client.PostAsJsonAsync($"/api/vaults/{vaultId}/folders", new { path = "archive" });
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+        var body = await second.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("case_conflict", body.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
     public async Task DeleteFolder_RemovesFilesAndSoftDeletesNotesAndAppendsDeleteRevisions()
     {
         var client = _app.CreateClient();
@@ -269,6 +358,46 @@ public class TreeAndFoldersTests : IAsyncLifetime
 
         var response = await client.DeleteAsync($"/api/vaults/{vaultId}/folders?path=ghost");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteFolder_DiskCleanupFails_StillSoftDeletesNotesAndReturnsSuccess()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "tree-admin-9");
+        client.UseBearerToken(admin.AccessToken);
+
+        var vaultId = await CreateVaultAsync(client, "Locked Vault");
+        var adminId = Guid.Parse(admin.User.GetProperty("id").GetString()!);
+        var note = await SeedNoteAsync(vaultId, "locked/a.md", "can't touch this", adminId);
+
+        // Hold an exclusive lock on the note's file so both the per-note File.Delete and the
+        // final recursive Directory.Delete sweep fail with IOException - exercising the
+        // best-effort disk cleanup path. The invariant under test is the whole point of the
+        // reorder: the DB transaction (soft-delete + revision) already committed before any disk
+        // cleanup was attempted, so a disk failure here must NOT roll back the DB side or fail
+        // the request - it's logged as a Warning and swallowed.
+        var filePath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), "locked", "a.md");
+        await using (new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var response = await client.DeleteAsync($"/api/vaults/{vaultId}/folders?path=locked");
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        }
+
+        using var scope = _app.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<SlateDbContext>();
+        var updatedNote = await db.Notes.SingleAsync(n => n.Id == note.Id);
+        Assert.True(updatedNote.IsDeleted);
+        Assert.True(await db.Revisions.AnyAsync(r => r.NoteId == note.Id && r.Kind == RevisionKind.Delete));
+
+        // The lock is released by now (the `await using` above scoped it), but the file/folder
+        // were left behind on disk since the sweep failed while it was held - orphaned, not
+        // cleaned up automatically, which is the accepted trade-off of best-effort cleanup.
+        Assert.True(File.Exists(filePath));
+
+        // The tree still must not resurrect the soft-deleted note, even though its file lingers.
+        var tree = await (await client.GetAsync($"/api/vaults/{vaultId}/tree")).Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Empty(tree.GetProperty("notes").EnumerateArray());
     }
 
     [Fact]

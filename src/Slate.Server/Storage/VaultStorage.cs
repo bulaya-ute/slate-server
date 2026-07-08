@@ -73,6 +73,15 @@ public class VaultStorage : IVaultStorage
                 throw new VaultPathException($"Path segment '{segment}' contains invalid characters.");
             }
 
+            // Windows silently strips trailing dots/spaces from a segment when it hits disk (e.g.
+            // "notes." and "notes" collide there, and "notes " round-trips as "notes"), so a path
+            // that's valid-looking here could resolve to a different, colliding path on that OS.
+            // Rejected outright rather than allowed to fail confusingly later.
+            if (segment.EndsWith('.') || segment.EndsWith(' '))
+            {
+                throw new VaultPathException($"Path segment '{segment}' must not end with a period or a space.");
+            }
+
             if (segment.Equals(".slate", StringComparison.OrdinalIgnoreCase))
             {
                 throw new VaultPathException("The '.slate' folder is reserved.");
@@ -107,7 +116,9 @@ public class VaultStorage : IVaultStorage
         Directory.CreateDirectory(directory);
 
         var bytes = Encoding.UTF8.GetBytes(content);
-        var hash = Convert.ToHexString(SHA256.HashData(bytes));
+        // Lowercase to match the documented contract (IVaultStorage.WriteNoteAtomicAsync) and
+        // common tooling conventions - Convert.ToHexString itself yields uppercase.
+        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
         var tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.tmp-{Guid.NewGuid():N}");
 
@@ -163,7 +174,7 @@ public class VaultStorage : IVaultStorage
 
         if (File.Exists(fullTo))
         {
-            throw new IOException($"A file already exists at '{toPath}'.");
+            throw new VaultConflictException($"A file already exists at '{toPath}'.");
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullTo)!);
@@ -188,6 +199,12 @@ public class VaultStorage : IVaultStorage
     public void CreateFolder(Guid vaultId, string path)
     {
         var fullPath = ResolvePath(vaultId, path);
+
+        if (File.Exists(fullPath))
+        {
+            throw new VaultConflictException($"A file already exists at '{path}'.");
+        }
+
         Directory.CreateDirectory(fullPath);
     }
 
@@ -218,7 +235,7 @@ public class VaultStorage : IVaultStorage
 
         if (Directory.Exists(fullTo) || File.Exists(fullTo))
         {
-            throw new IOException($"Something already exists at '{toPath}'.");
+            throw new VaultConflictException($"Something already exists at '{toPath}'.");
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullTo)!);

@@ -57,6 +57,15 @@ public class VaultStorageTests : IAsyncLifetime
     [InlineData("a|b.md")]
     [InlineData("a?b.md")]
     [InlineData("a*b.md")]
+    // Windows silently strips trailing dots/spaces from a path segment on disk, so a segment
+    // ending in either would resolve to a colliding, different-looking path there.
+    [InlineData("notes.")]
+    [InlineData("notes ")]
+    [InlineData("notes...")]
+    [InlineData("a./b.md")]
+    [InlineData("a /b.md")]
+    [InlineData("folder/trailing.dot.")]
+    [InlineData("folder /note.md")]
     public void SafePath_RejectsUnsafePaths(string path)
     {
         Assert.Throws<VaultPathException>(() => _storage.SafePath(path));
@@ -81,8 +90,12 @@ public class VaultStorageTests : IAsyncLifetime
 
         var (hash, size) = await _storage.WriteNoteAtomicAsync(vaultId, "notes/a.md", content);
 
-        var expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content)));
+        // Lowercase hex, per the documented contract (IVaultStorage.WriteNoteAtomicAsync) -
+        // Convert.ToHexString itself yields uppercase, so this also guards against a regression
+        // back to that.
+        var expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
         Assert.Equal(expectedHash, hash);
+        Assert.Equal(hash, hash.ToLowerInvariant());
         Assert.Equal(Encoding.UTF8.GetByteCount(content), size);
 
         var readBack = await _storage.ReadNoteAsync(vaultId, "notes/a.md");
@@ -106,7 +119,9 @@ public class VaultStorageTests : IAsyncLifetime
         var readBack = await _storage.ReadNoteAsync(vaultId, "note.md");
         Assert.Equal("version two, longer", readBack);
         Assert.Equal(Encoding.UTF8.GetByteCount("version two, longer"), size);
-        Assert.Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("version two, longer"))), hash);
+        Assert.Equal(
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("version two, longer"))).ToLowerInvariant(),
+            hash);
     }
 
     [Fact]
@@ -213,5 +228,29 @@ public class VaultStorageTests : IAsyncLifetime
         Assert.False(_storage.FolderExists(vaultId, "old"));
         Assert.True(_storage.FolderExists(vaultId, "new"));
         Assert.True(_storage.FolderExists(vaultId, "new/nested"));
+    }
+
+    [Fact]
+    public void MoveFolder_DestinationAlreadyExists_ThrowsVaultConflictException()
+    {
+        var vaultId = Guid.NewGuid();
+        _storage.CreateFolder(vaultId, "old");
+        _storage.CreateFolder(vaultId, "new");
+
+        // Specifically VaultConflictException (not just any IOException): callers rely on this
+        // narrower type to tell a genuine "already exists" collision apart from any other,
+        // unexpected IO failure.
+        Assert.Throws<VaultConflictException>(() => _storage.MoveFolder(vaultId, "old", "new"));
+    }
+
+    [Fact]
+    public void CreateFolder_FileAlreadyExistsAtPath_ThrowsVaultConflictException()
+    {
+        var vaultId = Guid.NewGuid();
+        var fullPath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), "notes");
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        File.WriteAllText(fullPath, "i am a file, not a folder");
+
+        Assert.Throws<VaultConflictException>(() => _storage.CreateFolder(vaultId, "notes"));
     }
 }

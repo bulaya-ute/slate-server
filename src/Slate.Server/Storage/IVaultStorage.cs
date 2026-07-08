@@ -42,7 +42,10 @@ public interface IVaultStorage
     /// <summary>Deletes a single file. Idempotent: no error if it's already gone.</summary>
     Task DeleteAsync(Guid vaultId, string path, CancellationToken cancellationToken = default);
 
-    /// <summary>Moves/renames a single file. Throws if the source is missing or the destination already exists.</summary>
+    /// <summary>
+    /// Moves/renames a single file. Throws <see cref="FileNotFoundException"/> if the source is
+    /// missing, or <see cref="VaultConflictException"/> if the destination already exists.
+    /// </summary>
     Task MoveAsync(Guid vaultId, string fromPath, string toPath, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -52,7 +55,11 @@ public interface IVaultStorage
     /// </summary>
     IReadOnlyList<VaultEntry> ListAll(Guid vaultId);
 
-    /// <summary>Creates a folder (and any missing parents). Idempotent: no error if it already exists.</summary>
+    /// <summary>
+    /// Creates a folder (and any missing parents). Idempotent: no error if it already exists.
+    /// Throws <see cref="VaultConflictException"/> if a file (not a directory) already occupies
+    /// that exact path.
+    /// </summary>
     void CreateFolder(Guid vaultId, string path);
 
     /// <summary>True if a directory exists at the given vault-relative path.</summary>
@@ -61,7 +68,11 @@ public interface IVaultStorage
     /// <summary>Recursively deletes a folder and everything under it. Idempotent: no error if it's already gone.</summary>
     void DeleteFolder(Guid vaultId, string path);
 
-    /// <summary>Moves/renames a folder (and everything under it) in one filesystem operation.</summary>
+    /// <summary>
+    /// Moves/renames a folder (and everything under it) in one filesystem operation. Throws
+    /// <see cref="DirectoryNotFoundException"/> if the source is missing, or
+    /// <see cref="VaultConflictException"/> if the destination already exists.
+    /// </summary>
     void MoveFolder(Guid vaultId, string fromPath, string toPath);
 
     /// <summary>Ensures the vault's root content directory exists on disk (called on vault creation).</summary>
