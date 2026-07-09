@@ -75,6 +75,33 @@ public class MarkdownIndexerTests
     }
 
     [Fact]
+    public void Extract_TagsInsideSingleBacktickCodeSpan_AreIgnored()
+    {
+        var result = MarkdownIndexer.Extract("Real tag #keep here, but `#nottag` should not count.", "fallback");
+        Assert.Contains("keep", result.Tags);
+        Assert.DoesNotContain("nottag", result.Tags);
+    }
+
+    [Fact]
+    public void Extract_TagsInsideDoubleBacktickCodeSpan_AreIgnored()
+    {
+        var result = MarkdownIndexer.Extract("Real tag #keep here, but ``#nottag`` should not count.", "fallback");
+        Assert.Contains("keep", result.Tags);
+        Assert.DoesNotContain("nottag", result.Tags);
+    }
+
+    [Fact]
+    public void Extract_LinksInsideBacktickCodeSpan_AreIgnored()
+    {
+        const string content = "Real: [[Real Note]] but `[[Not A Link]]` and ``[[Also Not A Link]]`` should not count.";
+
+        var result = MarkdownIndexer.Extract(content, "fallback");
+
+        var link = Assert.Single(result.Links);
+        Assert.Equal("Real Note", link.Target);
+    }
+
+    [Fact]
     public void Extract_DoesNotTreatHeadingHashAsTag()
     {
         var result = MarkdownIndexer.Extract("# Heading One\n\nBody #tag1 text.", "fallback");

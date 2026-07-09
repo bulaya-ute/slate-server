@@ -35,16 +35,19 @@ public interface IVaultStorage
     /// destination) so readers never observe a partially-written file. Creates parent directories
     /// as needed. Registers a write-marker for the resulting path/hash (see <see cref="RegisterWrite"/>)
     /// before the rename, for S5's watcher echo suppression. Returns the SHA-256 hash (lowercase hex)
-    /// and byte length of the UTF-8-encoded content.
+    /// and byte length of the UTF-8-encoded content. If the caller already computed the hash (e.g.
+    /// via <see cref="Common.ContentHasher"/> to build a DB row before this disk write), pass it as
+    /// <paramref name="precomputedHash"/> to skip re-hashing the same bytes.
     /// </summary>
-    Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(Guid vaultId, string path, string content, CancellationToken cancellationToken = default);
+    Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(Guid vaultId, string path, string content, CancellationToken cancellationToken = default, string? precomputedHash = null);
 
     /// <summary>
     /// Writes an attachment's raw bytes atomically (same temp-file-then-rename discipline as
     /// <see cref="WriteNoteAtomicAsync"/>, just without the UTF-8 text encoding step - attachments
-    /// are arbitrary binary content). Returns the SHA-256 hash (lowercase hex) and byte length.
+    /// are arbitrary binary content). Returns the SHA-256 hash (lowercase hex) and byte length. See
+    /// <see cref="WriteNoteAtomicAsync"/> for <paramref name="precomputedHash"/>.
     /// </summary>
-    Task<(string Sha256, long SizeBytes)> WriteAttachmentAtomicAsync(Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default);
+    Task<(string Sha256, long SizeBytes)> WriteAttachmentAtomicAsync(Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default, string? precomputedHash = null);
 
     /// <summary>Reads an attachment's raw bytes. Throws <see cref="FileNotFoundException"/> if it doesn't exist.</summary>
     Task<byte[]> ReadAttachmentAsync(Guid vaultId, string path, CancellationToken cancellationToken = default);
@@ -55,9 +58,10 @@ public interface IVaultStorage
     /// the design spec). Deliberately bypasses <see cref="SafePath"/>'s "'.slate' is reserved"
     /// rejection - this is the one legitimate internal writer of that subtree, never reachable from
     /// caller-supplied note/attachment/folder paths. Returns the SHA-256 hash (lowercase hex) and
-    /// byte length of the UTF-8-encoded content.
+    /// byte length of the UTF-8-encoded content. See <see cref="WriteNoteAtomicAsync"/> for
+    /// <paramref name="precomputedHash"/>.
     /// </summary>
-    Task<(string Sha256, long SizeBytes)> WriteConflictBlobAsync(Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default);
+    Task<(string Sha256, long SizeBytes)> WriteConflictBlobAsync(Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default, string? precomputedHash = null);
 
     /// <summary>Reads a previously written conflict blob. Throws <see cref="FileNotFoundException"/> if it doesn't exist.</summary>
     Task<string> ReadConflictBlobAsync(Guid vaultId, long revisionId, CancellationToken cancellationToken = default);

@@ -118,7 +118,7 @@ public class AttachmentsController : SlateControllerBase
 
             try
             {
-                await _storage.WriteAttachmentAtomicAsync(v, path, bytes, cancellationToken);
+                await _storage.WriteAttachmentAtomicAsync(v, path, bytes, cancellationToken, precomputedHash: hash);
             }
             catch (IOException ex)
             {

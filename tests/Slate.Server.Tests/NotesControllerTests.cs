@@ -191,6 +191,104 @@ public class NotesControllerTests : IAsyncLifetime
         Assert.Equal("device-b", conflictRevision.DeviceId);
     }
 
+    // Reproduces the head-claim TOCTOU directly: without the atomic conditional UPDATE, both
+    // concurrent PUTs with the same valid baseRevId can pass the C# HeadRevId == baseRevId check
+    // before either commits, so the loser's unconditional UPDATE overwrites the winner's head -
+    // both get 200, one edit silently lost, no conflict recorded, and the revision chain forks
+    // (two non-conflict revisions sharing a ParentRevId).
+    [Fact]
+    public async Task UpdateContent_ConcurrentPutsWithSameBaseRevId_OnlyOneSucceedsAndTheOtherGetsAConflict()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "notes-admin-race");
+        client.UseBearerToken(admin.AccessToken);
+        var vaultId = await CreateVaultAsync(client, "Vault");
+
+        var created = await (await client.PostAsJsonAsync($"/api/vaults/{vaultId}/notes",
+            new { path = "race.md", content = "original" })).Content.ReadFromJsonAsync<JsonElement>();
+        var noteId = created.GetProperty("id").GetString();
+        var baseRevId = created.GetProperty("headRevId").GetInt64();
+
+        var clientA = _app.CreateClient();
+        clientA.UseBearerToken(admin.AccessToken);
+        var clientB = _app.CreateClient();
+        clientB.UseBearerToken(admin.AccessToken);
+
+        var requestA = clientA.PutAsJsonAsync($"/api/notes/{noteId}/content",
+            new { content = "edit A", baseRevId, deviceId = "device-a" });
+        var requestB = clientB.PutAsJsonAsync($"/api/notes/{noteId}/content",
+            new { content = "edit B", baseRevId, deviceId = "device-b" });
+
+        var responses = await Task.WhenAll(requestA, requestB);
+
+        Assert.Equal(1, responses.Count(r => r.StatusCode == HttpStatusCode.OK));
+        Assert.Equal(1, responses.Count(r => r.StatusCode == HttpStatusCode.Conflict));
+
+        var winnerBody = await responses.Single(r => r.StatusCode == HttpStatusCode.OK).Content.ReadFromJsonAsync<JsonElement>();
+        var winnerRevId = winnerBody.GetProperty("revId").GetInt64();
+
+        var loserBody = await responses.Single(r => r.StatusCode == HttpStatusCode.Conflict).Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(winnerRevId, loserBody.GetProperty("headRevId").GetInt64());
+        var conflictRevId = loserBody.GetProperty("conflictRevId").GetInt64();
+
+        // The head file on disk holds exactly one of the two edits; the conflict blob holds the other.
+        var fullPath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), "race.md");
+        var headContent = await File.ReadAllTextAsync(fullPath);
+        Assert.True(headContent is "edit A" or "edit B");
+        var loserContent = headContent == "edit A" ? "edit B" : "edit A";
+
+        var conflictBlobPath = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), ".slate", "conflicts", $"{conflictRevId}.md");
+        Assert.True(File.Exists(conflictBlobPath));
+        Assert.Equal(loserContent, await File.ReadAllTextAsync(conflictBlobPath));
+
+        using var scope = _app.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<SlateDbContext>();
+        var note = await db.Notes.SingleAsync(n => n.Id == Guid.Parse(noteId!));
+        Assert.Equal(winnerRevId, note.HeadRevId);
+
+        // Exactly 3 revisions total: the original create, the winning (non-conflict) edit, and the
+        // conflict record - the loser's speculative fast-path revision insert must have been
+        // rolled back, not left as an orphan.
+        var revisions = await db.Revisions.Where(r => r.NoteId == note.Id).ToListAsync();
+        Assert.Equal(3, revisions.Count);
+
+        // No two non-conflict revisions share a ParentRevId - i.e. no fork in the head history.
+        var nonConflictByParent = revisions.Where(r => !r.IsConflict).GroupBy(r => r.ParentRevId);
+        Assert.All(nonConflictByParent, g => Assert.Single(g));
+    }
+
+    [Fact]
+    public async Task UpdateContent_NonexistentBaseRevId_ReturnsBadRequestWithoutOrphanBlob()
+    {
+        var client = _app.CreateClient();
+        var admin = await AuthTestHelpers.SetupAdminAndLoginAsync(client, username: "notes-admin-badrev");
+        client.UseBearerToken(admin.AccessToken);
+        var vaultId = await CreateVaultAsync(client, "Vault");
+
+        var created = await (await client.PostAsJsonAsync($"/api/vaults/{vaultId}/notes",
+            new { path = "badrev.md", content = "original" })).Content.ReadFromJsonAsync<JsonElement>();
+        var noteId = created.GetProperty("id").GetString();
+
+        var response = await client.PutAsJsonAsync($"/api/notes/{noteId}/content",
+            new { content = "doesn't matter", baseRevId = 999999L, deviceId = "device-x" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("invalid_base_rev", body.GetProperty("error").GetProperty("code").GetString());
+
+        using var scope = _app.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<SlateDbContext>();
+        var note = await db.Notes.SingleAsync(n => n.Id == Guid.Parse(noteId!));
+        Assert.False(note.HasConflict);
+        Assert.False(await db.Revisions.AnyAsync(r => r.NoteId == note.Id && r.IsConflict));
+
+        var conflictsDir = Path.Combine(_app.DataDir, "vaults", vaultId.ToString(), ".slate", "conflicts");
+        if (Directory.Exists(conflictsDir))
+        {
+            Assert.Empty(Directory.GetFiles(conflictsDir));
+        }
+    }
+
     [Fact]
     public async Task RenameNote_MovesFileAndResolvesPreviouslyUnresolvedLinks()
     {

@@ -115,7 +115,7 @@ public class NoteService
 
             try
             {
-                await _storage.WriteNoteAtomicAsync(vaultId, path, content, cancellationToken);
+                await _storage.WriteNoteAtomicAsync(vaultId, path, content, cancellationToken, precomputedHash: hash);
             }
             catch (IOException ex)
             {
@@ -177,25 +177,56 @@ public class NoteService
         var (hash, size) = ContentHasher.Compute(content);
         var now = DateTimeOffset.UtcNow;
 
-        var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
-        try
+        // Cheap early-out: if the head has already visibly moved, skip straight to the conflict
+        // path without the transaction/rollback dance below. This is NOT the race guard - see
+        // the comment on the atomic claim in ApplyFastPathEditAsync for that - just an
+        // optimization for the common, non-racing stale-client case.
+        if (note.HeadRevId == baseRevId)
         {
-            if (note.HeadRevId != baseRevId)
+            var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
+            UpdateContentOutcome? fastPathResult;
+            try
             {
-                return await RecordConflictAsync(transaction, note, content, hash, baseRevId.Value, authorId, deviceId, now, cancellationToken);
+                fastPathResult = await ApplyFastPathEditAsync(
+                    transaction, note, content, hash, size, baseRevId.Value, authorId, deviceId, now, cancellationToken);
+            }
+            finally
+            {
+                await transaction.DisposeAsync();
             }
 
-            return await ApplyFastPathEditAsync(transaction, note, content, hash, size, authorId, deviceId, now, cancellationToken);
+            if (fastPathResult is not null)
+            {
+                return fastPathResult;
+            }
+
+            // Lost the atomic head claim to a concurrent writer: ApplyFastPathEditAsync already
+            // rolled back this transaction (discarding our speculative revision insert), so the
+            // tracked `note` instance's HeadRevId is now stale relative to the DB - reload it so
+            // RecordConflictAsync below reports the winner's actual head, then fall through to
+            // record a proper conflict in a fresh transaction.
+            await _db.Entry(note).ReloadAsync(cancellationToken);
+        }
+
+        var conflictTransaction = await _db.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            return await RecordConflictAsync(conflictTransaction, note, content, hash, baseRevId.Value, authorId, deviceId, now, cancellationToken);
         }
         finally
         {
-            await transaction.DisposeAsync();
+            await conflictTransaction.DisposeAsync();
         }
     }
 
-    private async Task<UpdateContentOutcome> ApplyFastPathEditAsync(
+    /// <summary>
+    /// Attempts the fast-path (non-conflict) edit. Returns null if a concurrent writer claimed the
+    /// head first - see the atomic claim below - in which case the caller must treat this exactly
+    /// like a stale baseRevId and re-route into <see cref="RecordConflictAsync"/>.
+    /// </summary>
+    private async Task<UpdateContentOutcome?> ApplyFastPathEditAsync(
         Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction transaction,
-        Note note, string content, string hash, long size, Guid authorId, string deviceId, DateTimeOffset now,
+        Note note, string content, string hash, long size, long baseRevId, Guid authorId, string deviceId, DateTimeOffset now,
         CancellationToken cancellationToken)
     {
         var fallbackTitle = System.IO.Path.GetFileNameWithoutExtension(note.Path);
@@ -206,7 +237,7 @@ public class NoteService
         {
             VaultId = note.VaultId,
             NoteId = note.Id,
-            ParentRevId = note.HeadRevId,
+            ParentRevId = baseRevId,
             AuthorId = authorId,
             DeviceId = deviceId,
             Kind = RevisionKind.Edit,
@@ -218,14 +249,36 @@ public class NoteService
         _db.Revisions.Add(revision);
         await _db.SaveChangesAsync(cancellationToken);
 
-        note.HeadRevId = revision.Id;
-        note.ContentHash = hash;
-        note.SizeBytes = size;
-        note.Title = extracted.Title;
-        note.UpdatedAt = now;
+        // The actual race guard (mirrors the invite-claim pattern in AuthController.Register):
+        // the C# "note.HeadRevId == baseRevId" check the caller already did is a plain
+        // read-then-compare under Read Committed, so two concurrent PUTs with the same valid
+        // baseRevId can both pass it and both reach here. Only one of them may claim the head -
+        // done as a single conditional UPDATE (WHERE id AND head_rev_id = baseRevId) rather than
+        // a SELECT ... FOR UPDATE because it composes cleanly with the existing insert-then-claim
+        // shape and needs no extra locking statement: Postgres already serializes concurrent
+        // UPDATEs of the same row, so the loser's UPDATE blocks until the winner commits, then
+        // re-evaluates the WHERE against the now-committed row and affects zero rows - never a
+        // lost update. Deliberately does NOT touch note's change-tracked properties directly
+        // (no `note.HeadRevId = ...`); if the claim below fails and this transaction rolls back,
+        // any tracked in-memory mutation would still be sitting on the shared `note` instance and
+        // could get flushed as an unconditional overwrite by a later SaveChangesAsync.
+        var claimed = await _db.Notes
+            .Where(n => n.Id == note.Id && n.HeadRevId == baseRevId)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(n => n.HeadRevId, revision.Id)
+                .SetProperty(n => n.ContentHash, hash)
+                .SetProperty(n => n.SizeBytes, size)
+                .SetProperty(n => n.Title, extracted.Title)
+                .SetProperty(n => n.UpdatedAt, now), cancellationToken);
+
+        if (claimed == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return null;
+        }
 
         await ReindexNoteAsync(note, extracted, cancellationToken);
-        await UpdateSearchVectorAsync(note.Id, note.Title, plainText, cancellationToken);
+        await UpdateSearchVectorAsync(note.Id, extracted.Title, plainText, cancellationToken);
         await _db.SaveChangesAsync(cancellationToken);
 
         string? previousContent;
@@ -242,7 +295,7 @@ public class NoteService
 
         try
         {
-            await _storage.WriteNoteAtomicAsync(note.VaultId, note.Path, content, cancellationToken);
+            await _storage.WriteNoteAtomicAsync(note.VaultId, note.Path, content, cancellationToken, precomputedHash: hash);
         }
         catch (IOException ex)
         {
@@ -295,6 +348,21 @@ public class NoteService
         Note note, string content, string hash, long baseRevId, Guid authorId, string deviceId, DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        // Unlike the fast path (where baseRevId is guaranteed to equal a real HeadRevId we just
+        // read), baseRevId reaching here can be arbitrary client input - a stale/malicious
+        // client, a typo, or even a real revision id that belongs to a *different* note. Inserted
+        // straight into Revision.ParentRevId without checking, a nonexistent value trips the FK
+        // constraint as an unhandled DbUpdateException (500). Reject it as a client error instead:
+        // a 400 rather than 409, because this isn't a legitimate sync conflict with something to
+        // resolve against - the baseRevId doesn't name anything real for this note at all.
+        var baseRevisionExists = await _db.Revisions
+            .AnyAsync(r => r.Id == baseRevId && r.NoteId == note.Id, cancellationToken);
+        if (!baseRevisionExists)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return UpdateContentOutcome.Fail(400, "invalid_base_rev", "baseRevId does not reference a revision of this note.");
+        }
+
         var revision = new Revision
         {
             VaultId = note.VaultId,
@@ -316,7 +384,7 @@ public class NoteService
 
         try
         {
-            await _storage.WriteConflictBlobAsync(note.VaultId, revision.Id, content, cancellationToken);
+            await _storage.WriteConflictBlobAsync(note.VaultId, revision.Id, content, cancellationToken, precomputedHash: hash);
         }
         catch (IOException ex)
         {

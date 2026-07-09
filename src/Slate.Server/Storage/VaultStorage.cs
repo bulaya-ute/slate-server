@@ -109,17 +109,17 @@ public class VaultStorage : IVaultStorage
     }
 
     public Task<(string Sha256, long SizeBytes)> WriteNoteAtomicAsync(
-        Guid vaultId, string path, string content, CancellationToken cancellationToken = default)
+        Guid vaultId, string path, string content, CancellationToken cancellationToken = default, string? precomputedHash = null)
     {
         var fullPath = ResolvePath(vaultId, path);
-        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken);
+        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken, precomputedHash);
     }
 
     public Task<(string Sha256, long SizeBytes)> WriteAttachmentAtomicAsync(
-        Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default)
+        Guid vaultId, string path, byte[] content, CancellationToken cancellationToken = default, string? precomputedHash = null)
     {
         var fullPath = ResolvePath(vaultId, path);
-        return WriteBytesAtomicAsync(fullPath, content, cancellationToken);
+        return WriteBytesAtomicAsync(fullPath, content, cancellationToken, precomputedHash);
     }
 
     public async Task<byte[]> ReadAttachmentAsync(Guid vaultId, string path, CancellationToken cancellationToken = default)
@@ -134,13 +134,13 @@ public class VaultStorage : IVaultStorage
     }
 
     public Task<(string Sha256, long SizeBytes)> WriteConflictBlobAsync(
-        Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default)
+        Guid vaultId, long revisionId, string content, CancellationToken cancellationToken = default, string? precomputedHash = null)
     {
         // Bypasses ResolvePath/SafePath entirely - revisionId is a server-generated bigserial, never
         // caller-supplied text, so there's no traversal surface to validate against here, and
         // SafePath would reject the ".slate" segment outright regardless (see IVaultStorage docs).
         var fullPath = ConflictBlobPath(vaultId, revisionId);
-        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken);
+        return WriteBytesAtomicAsync(fullPath, Encoding.UTF8.GetBytes(content), cancellationToken, precomputedHash);
     }
 
     public async Task<string> ReadConflictBlobAsync(Guid vaultId, long revisionId, CancellationToken cancellationToken = default)
@@ -287,14 +287,17 @@ public class VaultStorage : IVaultStorage
     /// partially-written file.
     /// </summary>
     private async Task<(string Sha256, long SizeBytes)> WriteBytesAtomicAsync(
-        string fullPath, byte[] bytes, CancellationToken cancellationToken)
+        string fullPath, byte[] bytes, CancellationToken cancellationToken, string? precomputedHash = null)
     {
         var directory = Path.GetDirectoryName(fullPath)!;
         Directory.CreateDirectory(directory);
 
+        // Most callers (NoteService, AttachmentsController) already computed this via
+        // ContentHasher to build the DB row before this disk write - same bytes, same algorithm,
+        // same lowercase-hex format, so it's safe to reuse rather than hashing twice per write.
         // Lowercase to match the documented contract (IVaultStorage.WriteNoteAtomicAsync) and
         // common tooling conventions - Convert.ToHexString itself yields uppercase.
-        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        var hash = precomputedHash ?? Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
         var tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.tmp-{Guid.NewGuid():N}");
 

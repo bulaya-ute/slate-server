@@ -36,6 +36,12 @@ public static class MarkdownIndexer
     private static readonly Regex FrontmatterTagsKey = new(@"^tags:\s*(.*)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex FrontmatterListItem = new(@"^\s*-\s*(.+)$", RegexOptions.Compiled);
 
+    // Inline code spans: ``double-backtick`` (may contain single backticks) or `single-backtick`
+    // (may not), each confined to one line - the double alternative is tried first so a
+    // double-backtick span isn't mistaken for two single-backtick spans.
+    private static readonly Regex InlineCodeSpanPattern =
+        new(@"``(?:[^`\r\n]|`(?!`))*?``|`[^`\r\n]*?`", RegexOptions.Compiled);
+
     /// <summary>
     /// Extracts title, tags, and links from a note's raw content. <paramref name="fallbackTitle"/>
     /// (typically the note's filename without extension) is used when the content has no top-level
@@ -47,8 +53,14 @@ public static class MarkdownIndexer
         var stripped = StripFencedCodeBlocks(body);
 
         var title = ExtractTitle(stripped) ?? fallbackTitle;
-        var tags = MergeTags(ExtractInlineTags(stripped), frontmatterTags);
-        var links = ExtractLinks(stripped);
+
+        // Inline code spans (`like this` or ``like this``) are source, not tag/link syntax - a
+        // "#nottag" or "[[Not A Link]]" typed inside backticks shouldn't be indexed. Stripped only
+        // for tag/link scanning (title extraction is unaffected), mirroring how
+        // StripFencedCodeBlocks already protects multi-line code blocks from the same false positive.
+        var withoutInlineCode = StripInlineCodeSpans(stripped);
+        var tags = MergeTags(ExtractInlineTags(withoutInlineCode), frontmatterTags);
+        var links = ExtractLinks(withoutInlineCode);
 
         return new MarkdownIndexResult(title, tags, links);
     }
@@ -221,6 +233,14 @@ public static class MarkdownIndexer
             result.Add(cleaned);
         }
     }
+
+    /// <summary>
+    /// Removes inline code spans (single- or double-backtick delimited, e.g. <c>`#nottag`</c> or
+    /// <c>``[[Not A Link]]``</c>) so tag/link-shaped text typed as sample code isn't indexed as a
+    /// real tag or link. Replaces each span with a single space rather than deleting it outright,
+    /// so surrounding words don't get glued together.
+    /// </summary>
+    private static string StripInlineCodeSpans(string text) => InlineCodeSpanPattern.Replace(text, " ");
 
     /// <summary>
     /// Removes fenced code blocks (``` or ~~~, 3+ characters, matching CommonMark's rule that the
